@@ -66,6 +66,35 @@ rows and move on -- no retry loops, no distributed-lock machinery.
 The CAS coordination is **per-board** — each board is a separate DB,
 so multi-board installs get the same atomicity guarantees without any
 new locking.
+
+Content safety gates
+--------------------
+Two gates run against any task with a ``workspace_path`` set, at both
+places a task can leave live work behind: :func:`complete_task` (running
+|ready -> done) and the dashboard's review-transition path
+(``plugin_api._set_status_direct`` with ``new_status == "review"``). Logic
+lives in ``hermes_cli/content_gate.py``.
+
+* **Open-dependency gate** — blocks the transition if any parent of the
+  task is not ``done``/``archived``, raising ``OpenDependencyError``. This
+  catches a task shipping while a sibling task providing required inputs
+  (a dataset, an API contract, etc.) is still open.
+* **Placeholder content scan** — scans the task's changed files (``git
+  diff`` against ``origin/main``, falling back to a working-tree diff) for
+  placeholder/stub markers — literal "TBC", "lorem ipsum", leaked
+  internal notes like "will be refreshed", unrendered ``{{...}}``
+  template tokens, etc (see ``content_gate.PLACEHOLDER_MARKERS``) —
+  raising ``PlaceholderContentError`` on a hit.
+
+Both exceptions carry the offending detail (``.blocking_parents`` /
+``.hits``) and emit a ``completion_blocked_*`` audit event before raising.
+Deliberate bypass is supported via ``override_dependency_check`` /
+``override_placeholder_check`` kwargs on ``complete_task`` (or the
+``override`` flag threaded through the dashboard's PATCH endpoint) —
+each bypass still emits a ``dependency_override`` / ``placeholder_override``
+event so the exception is auditable. These overrides exist for
+human-confirmed exceptions; routine workers should fix the underlying
+issue (close the open parent, replace the placeholder text) instead.
 """
 
 from __future__ import annotations
@@ -89,6 +118,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from hermes_cli import content_gate
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -3975,6 +4005,51 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class OpenDependencyError(ValueError):
+    """Raised by ``complete_task`` when a parent is still open at completion.
+
+    A sibling task providing required inputs (a dataset, an API contract,
+    etc.) being open at completion time is exactly how the placeholder-
+    content incident shipped: the child task completed before its parent
+    finished, and nothing caught the still-open dependency. The blocking
+    parents are attached as ``.blocking_parents`` (each a
+    ``{"id", "title", "status"}`` dict — see
+    :func:`hermes_cli.content_gate.open_parent_summaries`) for callers that
+    want structured access.
+    """
+
+    def __init__(self, blocking_parents: list[dict], completing_task_id: str):
+        self.blocking_parents = list(blocking_parents)
+        self.completing_task_id = completing_task_id
+        names = ", ".join(
+            f"{p['title']!r} ({p['id']}, status={p['status']})"
+            for p in blocking_parents
+        )
+        super().__init__(
+            f"completion blocked: task has open parent(s) not yet done — {names}"
+        )
+
+
+class PlaceholderContentError(ValueError):
+    """Raised by ``complete_task`` when changed files contain placeholder
+    or stub content markers (see
+    :data:`hermes_cli.content_gate.PLACEHOLDER_MARKERS`).
+
+    The hits are attached as ``.hits`` (``{path: [marker descriptions]}``)
+    for callers that want structured access.
+    """
+
+    def __init__(self, hits: dict[str, list[str]], completing_task_id: str):
+        self.hits = dict(hits)
+        self.completing_task_id = completing_task_id
+        details = "; ".join(
+            f"{path}: {', '.join(markers)}" for path, markers in hits.items()
+        )
+        super().__init__(
+            f"completion blocked: placeholder/stub content detected — {details}"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3984,6 +4059,8 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    override_dependency_check: bool = False,
+    override_placeholder_check: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4006,6 +4083,29 @@ def complete_task(
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
+
+    When the task has a ``workspace_path`` set, two additional content
+    safety gates run before the main write txn (see
+    ``hermes_cli/content_gate.py``):
+
+    * **Open-dependency gate** — if any parent of ``task_id`` is not
+      ``done``/``archived``, completion is blocked with
+      ``OpenDependencyError`` unless ``override_dependency_check=True``.
+    * **Placeholder content scan** — the task's changed files (via
+      ``git diff`` against ``origin/main``, falling back to the working
+      tree vs last commit) are scanned for placeholder/stub markers
+      (literal "TBC", "lorem ipsum", leaked internal notes, unrendered
+      template tokens, etc). Any hit blocks completion with
+      ``PlaceholderContentError`` unless
+      ``override_placeholder_check=True``.
+
+    Both gates emit a ``completion_blocked_*`` event before raising (same
+    pattern as the hallucinated-cards gate) so the rejection is auditable,
+    and an ``*_override`` event when the override kwarg bypasses them, so
+    the bypass itself is auditable too. These overrides exist for
+    human-confirmed exceptions — routine workers should fix the underlying
+    issue (close the open parent, replace the placeholder text) rather
+    than reach for them.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -4041,6 +4141,45 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gates: open-dependency + placeholder content scan, BEFORE the main
+    # write txn (same style as the created_cards gate above). Both only
+    # run when the task has a workspace_path — a task with no workspace
+    # has no diff to scan and the dependency gate is orthogonal to that,
+    # but content_gate's checks are specifically about what a worker
+    # ships from a workspace, so we scope both to workspace-bearing tasks.
+    _completing_task = get_task(conn, task_id)
+    if _completing_task is not None and _completing_task.workspace_path:
+        blocking_parents = content_gate.open_parent_summaries(conn, task_id)
+        if blocking_parents and not override_dependency_check:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_dependency",
+                    {"blocking_parents": blocking_parents},
+                )
+            raise OpenDependencyError(blocking_parents, task_id)
+        elif blocking_parents:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "dependency_override",
+                    {"overridden": True, "blocking_parents": blocking_parents},
+                )
+
+        changed_files = content_gate.diff_changed_files(_completing_task.workspace_path)
+        placeholder_hits = content_gate.scan_paths_for_placeholders(changed_files)
+        if placeholder_hits and not override_placeholder_check:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_placeholder",
+                    {"hits": placeholder_hits},
+                )
+            raise PlaceholderContentError(placeholder_hits, task_id)
+        elif placeholder_hits:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "placeholder_override",
+                    {"overridden": True, "hits": placeholder_hits},
+                )
 
     with write_txn(conn):
         if expected_run_id is None:

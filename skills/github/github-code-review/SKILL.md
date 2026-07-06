@@ -479,3 +479,60 @@ git branch -D pr-$PR_NUMBER
 - **Approve** — no critical or warning-level issues, only minor suggestions or all clear
 - **Request Changes** — any critical or warning-level issue that should be fixed before merge
 - **Comment** — observations and suggestions, but nothing blocking (use when you're unsure or the PR is a draft)
+
+---
+
+## 6. Recovery / Stranded-Worktree PR Integrity Check
+
+A stranded-worktree recovery PR (a branch/description that reads as "recovering" work from a
+worktree that got orphaned mid-task) is a special case: its description was written from memory
+about what got lost, not from a live diff, so it's the PR type most likely to under- or
+mis-describe its own scope. Run this check on any PR whose branch name or description uses
+recovery language before approving or merging it.
+
+### Step 1: Detect recovery language
+
+Read the PR description. If it contains phrases like "recovery", "stranded worktree",
+"stranded-worktree", or "recovered branch" (case-insensitive), this check applies. Otherwise skip
+straight to the normal review workflow above.
+
+### Step 2: Gather the claimed vs actual scope
+
+```bash
+# What the description claims (read it yourself — no command for this)
+gh pr view $PR_NUMBER --json body --jq '.body'
+
+# What actually changed
+gh pr diff $PR_NUMBER --stat
+```
+
+### Step 3: Compare
+
+Either call the helper directly:
+
+```python
+from hermes_cli.content_gate import flag_recovery_pr_mismatch
+
+warning = flag_recovery_pr_mismatch(pr_description, diff_stat_text)
+```
+
+or do the manual equivalent: list every file-path-looking token the description names (backtick-
+quoted paths, or bare `dir/file.ext`-shaped tokens), and check each one actually appears in the
+`--stat` output. Also compare file counts — if the description names only 1-2 files but the diff
+touches 3x or more, the description understates the scope.
+
+### Step 4: Treat a mismatch as a hold, not an auto-block
+
+`flag_recovery_pr_mismatch` (and the manual check) is a **signal to pause and get explicit human
+confirmation**, not an automatic rejection. A legitimate recovery can still touch more files than
+the description mentions (e.g. a lockfile regenerated as a side effect). When the check flags a
+mismatch:
+
+1. Do **not** approve or merge the PR yet.
+2. Post the mismatch details as a review comment (named files missing from the diff, or the
+   file-count discrepancy) so the reviewer (human or the next agent) sees it immediately.
+3. Explicitly ask a human to confirm the extra/missing scope is expected before merging.
+4. Only proceed with Approve / Request Changes once that confirmation is in hand.
+
+When the check finds nothing (returns `None` — no recovery language detected, or the named files
+and diff line up), continue with the normal PR Review Workflow (Section 5) as usual.
