@@ -2323,6 +2323,108 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
 
 
 # ---------------------------------------------------------------------------
+# Content safety gates on complete_task (placeholder incident)
+# ---------------------------------------------------------------------------
+
+def test_complete_task_raises_placeholder_content_error(kanban_home, tmp_path):
+    """A changed file containing a placeholder marker blocks completion."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "post.md").write_text("Author: Placeholder model\nTBC\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "post.md"], check=True, capture_output=True, text=True)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship blog post",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        with pytest.raises(kb.PlaceholderContentError) as exc_info:
+            kb.complete_task(conn, t, result="shipped")
+        assert any(path.endswith("post.md") for path in exc_info.value.hits)
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status != "done"
+        events = kb.list_events(conn, t)
+        assert any(e.kind == "completion_blocked_placeholder" for e in events)
+
+
+def test_complete_task_placeholder_override_succeeds_and_emits_event(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "post.md").write_text("Author: Placeholder model\nTBC\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "post.md"], check=True, capture_output=True, text=True)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship blog post",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        ok = kb.complete_task(
+            conn, t, result="shipped", override_placeholder_check=True,
+        )
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "done"
+        events = kb.list_events(conn, t)
+        assert any(e.kind == "placeholder_override" for e in events)
+
+
+def test_complete_task_raises_open_dependency_error(kanban_home, tmp_path):
+    """A still-open parent blocks completion of a workspace-bearing task."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="dataset task")
+        child = kb.create_task(
+            conn, title="ship blog post",
+            workspace_kind="worktree", workspace_path=str(repo),
+            parents=[parent],
+        )
+        # The child was demoted to 'todo' by create_task because its
+        # parent is still open — force it into a completable status to
+        # exercise the case where a worker (mistakenly, or via a stale
+        # claim) attempts to complete a task whose dependency link was
+        # never satisfied. This mirrors the incident: the sibling
+        # providing the dataset was still open when the child shipped.
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child,))
+        conn.commit()
+        with pytest.raises(kb.OpenDependencyError) as exc_info:
+            kb.complete_task(conn, child, result="shipped")
+        assert exc_info.value.blocking_parents[0]["id"] == parent
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status != "done"
+        events = kb.list_events(conn, child)
+        assert any(e.kind == "completion_blocked_dependency" for e in events)
+
+
+def test_complete_task_dependency_override_succeeds_and_emits_event(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="dataset task")
+        child = kb.create_task(
+            conn, title="ship blog post",
+            workspace_kind="worktree", workspace_path=str(repo),
+            parents=[parent],
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child,))
+        conn.commit()
+        ok = kb.complete_task(
+            conn, child, result="shipped", override_dependency_check=True,
+        )
+        assert ok is True
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "done"
+        events = kb.list_events(conn, child)
+        assert any(e.kind == "dependency_override" for e in events)
+
+
+# ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 
