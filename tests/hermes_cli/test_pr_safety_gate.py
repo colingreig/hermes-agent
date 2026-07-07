@@ -172,6 +172,52 @@ def test_check_recovery_pr_detected_via_branch_alone_still_cross_checks_diff():
     assert result.mismatch is not None
 
 
+def test_check_recovery_pr_self_referential_exemption_not_flagged():
+    """A PR that touches the gate's own implementation and merely discusses
+    recovery PRs as a feature (not a genuine stranded-worktree recovery)
+    must not be flagged, even though its description reads exactly like a
+    real recovery PR's would. Regression for PR #14, which was falsely
+    blocked because its description explained this very check."""
+    result = psg.check_recovery_pr(
+        branch_name="ignite-cycle-20260706-131700",
+        pr_title="Cycle batch: Slack config fallback + recovery-PR safety gate",
+        pr_description=(
+            "Automates the recovery/stranded-worktree PR description/diff "
+            "mismatch check (a recovery PR is a PR created to rescue work "
+            "from a stranded/abandoned git worktree) into a required CI "
+            "check. Also fixes `config.platforms` handling."
+        ),
+        diff_stat_text=(
+            "hermes_cli/pr_safety_gate.py | 40 ++++++++++\n"
+            "hermes_cli/content_gate.py | 20 +++++\n"
+            "tools/send_message_tool.py | 42 +++++++++\n"
+            "3 files changed, 102 insertions(+)"
+        ),
+    )
+    assert result.is_recovery_pr is False
+    assert result.mismatch is None
+    assert result.blocked is False
+
+
+def test_check_recovery_pr_branch_name_overrides_self_referential_exemption():
+    """A genuine recovery/salvage branch that happens to also touch the
+    gate's own files must still be checked -- the branch-name signal is
+    stronger than the self-referential exemption."""
+    result = psg.check_recovery_pr(
+        branch_name="salvage/gate-fix",
+        pr_title="Salvage stranded worktree changes",
+        pr_description="Restores `src/only_named.py`.",
+        diff_stat_text=(
+            "hermes_cli/pr_safety_gate.py | 5 +-\n"
+            "src/only_named.py | 2 +-\n"
+            "src/extra.py | 3 +-\n"
+            "3 files changed, 10 insertions(+)"
+        ),
+    )
+    assert result.is_recovery_pr is True
+    assert result.mismatch is not None
+
+
 # ---------------------------------------------------------------------------
 # _git_diff_stat — local git fallback behavior
 # ---------------------------------------------------------------------------

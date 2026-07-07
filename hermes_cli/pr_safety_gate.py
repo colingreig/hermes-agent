@@ -50,6 +50,18 @@ from hermes_cli.content_gate import flag_recovery_pr_mismatch
 _RECOVERY_BRANCH_RE = re.compile(r"^(recover|recovery|salvage)/", re.IGNORECASE)
 _RECOVERY_TITLE_RE = re.compile(r"\b(recovery|stranded|salvage)\b", re.IGNORECASE)
 
+# Self-referential exemption: a PR that touches the gate's own implementation
+# (this file, or content_gate.py's flag_recovery_pr_mismatch it wraps) will
+# inevitably discuss "recovery"/"stranded worktree" in its title/description
+# -- it IS the feature that talks about that -- which would otherwise always
+# false-positive the title/description signal against itself (observed live:
+# PR #14, whose description explains this very check, got flagged as a
+# mismatched recovery PR for naming `config.platforms`/`config.yaml` in
+# unrelated prose). The branch-name pattern is a genuine structural signal a
+# real recovery PR could still carry even while touching these files, so it
+# still overrides this exemption.
+_GATE_OWN_FILES = ("hermes_cli/pr_safety_gate.py", "hermes_cli/content_gate.py")
+
 
 class RecoveryPrCheckResult(NamedTuple):
     """Outcome of :func:`check_recovery_pr`."""
@@ -100,6 +112,11 @@ def check_recovery_pr(
     human-readable warning string if the description doesn't match the
     diff, or ``None`` if everything lines up.
     """
+    branch_signals_recovery = bool(branch_name and _RECOVERY_BRANCH_RE.search(branch_name.strip()))
+    touches_gate_own_code = any(f in (diff_stat_text or "") for f in _GATE_OWN_FILES)
+    if touches_gate_own_code and not branch_signals_recovery:
+        return RecoveryPrCheckResult(is_recovery_pr=False, mismatch=None)
+
     recovery = is_recovery_pr(
         branch_name=branch_name, pr_title=pr_title, pr_description=pr_description,
     )
