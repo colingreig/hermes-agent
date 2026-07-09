@@ -1496,6 +1496,10 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
+            # No auxiliary.vision.fallback default: this task is multimodal
+            # (image input) and zai's coding endpoint (glm-4.7) is text-only,
+            # so it would fail or silently degrade rather than recover.
+            # Needs a vision-capable fallback provider — out of scope here.
         },
         "web_extract": {
             "provider": "auto",
@@ -1504,6 +1508,15 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
+            # No auxiliary.web_extract.fallback default: kept out of scope
+            # alongside auxiliary.vision above as a conservative choice for
+            # a task named after web *content* extraction, which can carry
+            # image payloads depending on the caller. (Its one current
+            # production call site — tools/browser_tool.py's browser-snapshot
+            # extractor — happens to be text-only today, but that's an
+            # implementation detail, not a contract; a text-only glm-4.7
+            # fallback here would be a footgun if that changes. Revisit with
+            # a vision-capable fallback provider in a follow-up.)
         },
         "compression": {
             "provider": "auto",
@@ -1555,6 +1568,18 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
             "extra_body": {},
+            # See auxiliary.compression.fallback above — same opt-in hard-error
+            # failover. Approval routes shell-command risk classification
+            # through call_llm(task="approval", ...) (tools/approval.py), so a
+            # dead primary provider previously meant every "smart" approval
+            # gate silently degraded to always-prompt/deny instead of
+            # recovering. glm-4.7 is a capable text-only model — fine here
+            # since this is a short text classification, not multimodal.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         "mcp": {
             "provider": "auto",
@@ -1563,6 +1588,15 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
             "extra_body": {},
+            # See auxiliary.compression.fallback above — same opt-in hard-error
+            # failover, for MCP sampling requests (tools/mcp_tool.py calls
+            # call_llm(task="mcp", ...)). Text-only traffic, so glm-4.7 is a
+            # safe fallback model.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         "title_generation": {
             "provider": "auto",
@@ -1572,7 +1606,20 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
             "language": "",
+            # See auxiliary.compression.fallback above — same opt-in hard-error
+            # failover (agent/title_generator.py calls call_llm(task=
+            # "title_generation", ...)). Text-only summarisation, so glm-4.7
+            # is a safe fallback model.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
+        # No auxiliary.tts_audio_tags.fallback default: this is a
+        # Gemini-TTS-specific feature (rewriting text with Gemini's audio
+        # emotion/style tags), not a generic completion — glm-4.7 has no
+        # equivalent to fail over to. Out of scope here.
         "tts_audio_tags": {
             "provider": "auto",
             "model": "",
@@ -1586,6 +1633,15 @@ DEFAULT_CONFIG = {
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
         # cheap, capable model here (gemini-flash works well); the main
         # model is overkill for short spec expansion.
+        #
+        # No auxiliary.triage_specifier.fallback default (yet): unlike
+        # approval/mcp/title_generation/monitor above, hermes_cli/kanban_specify.py
+        # gets its client via get_text_auxiliary_client() and calls
+        # client.chat.completions.create() directly rather than going through
+        # call_llm(task=...) — so it never reaches
+        # agent/auxiliary_client.py::_try_task_fallback_once() and a
+        # ``fallback`` block here would be a silent no-op. Needs the call
+        # site rewired onto call_llm() first — out of scope here.
         "triage_specifier": {
             "provider": "auto",
             "model": "",
@@ -1611,6 +1667,13 @@ DEFAULT_CONFIG = {
         # of what a profile is good at. Invoked by
         # ``hermes profile describe <name> --auto`` and the dashboard's
         # auto-generate button. Short, cheap call.
+        #
+        # No auxiliary.profile_describer.fallback default (yet): same reason
+        # as auxiliary.triage_specifier above — hermes_cli/profile_describer.py
+        # calls get_text_auxiliary_client() + client.chat.completions.create()
+        # directly, bypassing call_llm()'s _try_task_fallback_once() path. A
+        # fallback block here would be a no-op until that call site is
+        # rewired — out of scope here.
         "profile_describer": {
             "provider": "auto",
             "model": "",
@@ -1624,6 +1687,13 @@ DEFAULT_CONFIG = {
         # building over hundreds of candidate skills). "auto" = use main chat
         # model; override via `hermes model` → auxiliary → Curator to route
         # to a cheaper aux model (e.g. openrouter google/gemini-3-flash-preview).
+        #
+        # No auxiliary.curator.fallback default (yet): curator runs as a full
+        # AIAgent fork through hermes_cli.runtime_provider.resolve_runtime_provider
+        # (agent/curator.py::_resolve_review_runtime), a completely different
+        # code path from call_llm() — it never reaches
+        # _try_task_fallback_once() either, so a fallback block here would
+        # also be a no-op. Out of scope here.
         "curator": {
             "provider": "auto",
             "model": "",
@@ -1645,6 +1715,17 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 60,
             "extra_body": {},
+            # See auxiliary.compression.fallback above — same opt-in hard-error
+            # failover. High-volume per-item classification
+            # (cron/scripts/classify_items.py calls call_llm(task="monitor",
+            # ...)); a dead primary provider previously meant the entire
+            # important-mail monitor catalog silently stopped scoring items.
+            # Text-only scoring, so glm-4.7 is a safe fallback model.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         # Background review — the post-turn self-improvement fork that decides
         # whether to save a memory / patch a skill. "auto" (default) = run on
