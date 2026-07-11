@@ -4784,7 +4784,7 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
-             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+             patch("cron.scheduler._DaemonThreadPoolExecutor") as mock_pool_cls:
             mock_pool = MagicMock()
             mock_pool_cls.return_value = mock_pool
 
@@ -4815,7 +4815,7 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
-             patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
+             patch("cron.scheduler._DaemonThreadPoolExecutor") as mock_pool_cls:
             mock_pool = MagicMock()
             mock_pool_cls.return_value = mock_pool
 
