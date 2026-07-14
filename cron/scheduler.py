@@ -2173,6 +2173,22 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
+
+    # Register the job's own declared required_environment_variables as
+    # sandbox passthrough BEFORE the agent session starts, so an agent-run
+    # job's terminal-tool subprocesses (e.g. `op-run`, `node clickup.mjs`)
+    # can see secret-shaped vars like CLICKUP_API_TOKEN without needing a
+    # loaded skill's SKILL.md to separately declare the same name in its
+    # frontmatter. This mirrors — and is independent of — the
+    # skill-frontmatter-driven registration that skill_view() performs
+    # below for each of the job's skills.
+    job_required_env = _normalize_required_environment_variables(
+        job.get("required_environment_variables")
+    )
+    if job_required_env:
+        from tools.env_passthrough import register_env_passthrough
+        register_env_passthrough(job_required_env)
+
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
