@@ -1619,6 +1619,101 @@ class TestRunJobSessionPersistence:
         assert "final fallback report" in output
         assert "(FAILED)" not in output
 
+    def test_run_job_budget_exhausted_fails_closed_despite_final_response(self, tmp_path):
+        """86e2d6h8y: a ``budget_exhausted`` turn must fail closed even when the
+        agent produced a substantive ``final_response``. Unlike
+        ``max_iterations_reached(...)``, ``budget_exhausted`` does not qualify
+        for the max-iteration-summary carve-out, so ``completed=False`` here
+        must still raise and be surfaced as a cron failure rather than
+        delivered as a PARTIAL success.
+        """
+        job = {
+            "id": "budget-exhausted-job",
+            "name": "budget exhausted",
+            "prompt": "do something expensive",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "here is what I got before the budget ran out",
+                "completed": False,
+                "failed": False,
+                "turn_exit_reason": "budget_exhausted",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error is not None
+        # Output should be the FAILED template, not the success template.
+        assert "(FAILED)" in output
+        # Ephemeral cron agent must still be closed even on agent-flagged failure.
+        mock_agent.close.assert_called_once()
+
+    def test_run_job_max_iterations_reached_with_response_still_partial(self, tmp_path):
+        """86e2d6h8y no-regression guard: a genuine
+        ``max_iterations_reached(...)`` turn_exit_reason with a substantive
+        final_response must still be delivered as a PARTIAL success (not
+        raised), distinguishing it from the ``budget_exhausted`` fail-closed
+        case above.
+        """
+        job = {
+            "id": "max-iterations-job",
+            "name": "max iterations",
+            "prompt": "finish the long task",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "partial progress summary before hitting the limit",
+                "completed": False,
+                "failed": False,
+                "turn_exit_reason": "max_iterations_reached(60/60)",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "partial progress summary before hitting the limit"
+        assert "partial progress summary before hitting the limit" in output
+        assert "(FAILED)" not in output
+
     def test_tick_marks_empty_response_as_error(self, tmp_path):
         """When run_job returns success=True but final_response is empty,
         tick() should mark the job as error so last_status != 'ok'.
