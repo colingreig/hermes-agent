@@ -138,7 +138,7 @@ def _match_decision_thread(channel: str, thread_ts: str) -> Optional[str]:
     if not thread_ts:
         return None
     try:
-        with open(_REVIEW_SLA_STATE_PATH, encoding='utf-8') as f:
+        with open(_REVIEW_SLA_STATE_PATH, encoding="utf-8") as f:
             state = json.load(f)
     except Exception:
         return None
@@ -571,26 +571,6 @@ class SlackAdapter(BasePlatformAdapter):
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
 
-        # HERMES-PATCH 22: slack-watchdog-owns-reconnect (2026-06-24)
-        # Disable slack_sdk's internal auto-reconnect. AsyncSocketModeHandler does
-        # not forward auto_reconnect_enabled, so it defaults to True and slack_sdk
-        # retries a dead aiohttp session forever ("Session is closed"). That loop
-        # both (a) floods the logs and (b) makes close_async() hang — which on
-        # 2026-06-24 was awaited inside _socket_reconnect_lock, deadlocking the
-        # lock and blinding this adapter's watchdog for 3.5h. With it off, a
-        # dropped socket surfaces deterministically (is_connected()->False) and
-        # the watchdog owns reconnection by building a fresh handler/session.
-        _client = getattr(self._handler, "client", None)
-        if _client is not None:
-            try:
-                _client.auto_reconnect_enabled = False
-                _client.default_auto_reconnect_enabled = False
-            except Exception:  # pragma: no cover - defensive
-                logger.debug(
-                    "[Slack] Could not disable internal auto-reconnect",
-                    exc_info=True,
-                )
-
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         task.add_done_callback(self._on_socket_mode_task_done)
@@ -604,16 +584,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         if handler is not None:
             try:
-                # HERMES-PATCH 22: slack-close-timeout (2026-06-24) — close_async()
-                # can hang on a broken/closed session. Because this runs inside
-                # _socket_reconnect_lock, an unbounded hang holds the lock forever
-                # and permanently blinds the watchdog (observed 2026-06-24). Bound
-                # it so a hang can never freeze self-healing again.
-                await asyncio.wait_for(handler.close_async(), timeout=10)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "[Slack] close_async() timed out after 10s; abandoning handler"
-                )
+                await handler.close_async()
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning(
                     "[Slack] Error while closing Socket Mode handler: %s",
@@ -624,8 +595,8 @@ class SlackAdapter(BasePlatformAdapter):
         if task is not None and not task.done():
             task.cancel()
             try:
-                await asyncio.wait_for(task, timeout=10)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+                await task
+            except asyncio.CancelledError:
                 pass
             except Exception:  # pragma: no cover - defensive logging
                 logger.debug(
@@ -2952,7 +2923,7 @@ class SlackAdapter(BasePlatformAdapter):
                     or (event.get("subtype") == "bot_message")
                     or (user_id and bot_uid and user_id == bot_uid)
                 )
-                if not _is_own:
+                if not _is_own and self._is_sender_authorized(user_id, chat_type="thread", chat_id=channel_id) is True:
                     _dtid = _match_decision_thread(channel_id, event_thread_ts)
                     if _dtid:
                         _reply = (text or original_text or "").strip()
