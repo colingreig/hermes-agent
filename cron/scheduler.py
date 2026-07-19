@@ -3390,15 +3390,17 @@ Skipped because Python was already shutting down before the cron worker could be
                 explainer_text = AIAgent._format_turn_completion_explanation(turn_exit_reason).strip()
             except Exception:
                 explainer_text = ""
-        # HERMES-PATCH 03: an iteration/budget stop that still produced a
+        # HERMES-PATCH 03: a max-iterations stop that still produced a
         # substantive report is PARTIAL work, not a failure. Upstream already
         # spares "max_iterations_reached" stops with any non-empty response; we
         # only keep the exact turn-completion explainer out of this path so a
         # real fallback summary is not rejected just because it is short.
+        # NOTE: "budget_exhausted" is deliberately NOT in this carve-out — a
+        # budget stop must fail closed even with a report (regression 86e2d6h8y).
         max_iteration_summary = (
             result.get("failed") is not True
             and result.get("completed") is False
-            and turn_exit_reason.startswith(("max_iterations_reached(", "budget_exhausted"))
+            and turn_exit_reason.startswith("max_iterations_reached(")
             and final_response_text
             and final_response_text != explainer_text
         )
