@@ -155,10 +155,51 @@ def _load_clickup_helper() -> Any | None:
     return module
 
 
+_CLICKUP_TOKEN_CACHE: str | None = None
+
+
+def _resolve_clickup_token() -> str:
+    """Resolve the ClickUp API token.
+
+    Resolution order (matches the repo's standing pattern, see
+    ``wp_publish.py:resolve_credential``):
+      1. ``agent.lazy_secret_resolver.get("CLICKUP_API_TOKEN")`` — per-call
+         lazy 1Password resolution. Import/lookup failures are swallowed
+         here exactly like that module's own fail-open contract — they just
+         mean "not resolvable this way, try the next".
+      2. ``os.environ["CLICKUP_API_TOKEN"]`` — plain env var fallback.
+
+    Never logs the resolved value. Result is cached in-process so repeated
+    calls to ``_fallback_req`` don't re-resolve on every request.
+    """
+    global _CLICKUP_TOKEN_CACHE
+    if _CLICKUP_TOKEN_CACHE:
+        return _CLICKUP_TOKEN_CACHE
+
+    value: str | None = None
+    try:
+        from agent import lazy_secret_resolver
+
+        value = lazy_secret_resolver.get("CLICKUP_API_TOKEN")
+    except Exception:
+        value = None
+
+    if not value:
+        value = os.environ.get("CLICKUP_API_TOKEN")
+
+    token = (value or "").strip()
+    if token:
+        _CLICKUP_TOKEN_CACHE = token
+    return token
+
+
 def _fallback_req(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
-    token = os.environ.get("CLICKUP_API_TOKEN", "").strip()
+    token = _resolve_clickup_token()
     if not token:
-        print("ERROR: CLICKUP_API_TOKEN not set in env", file=sys.stderr)
+        print(
+            "ERROR: CLICKUP_API_TOKEN not set in env and could not be resolved via 1Password",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
