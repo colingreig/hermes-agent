@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import scripts.clickup_workspace_refresh as refresh_mod
 
 
@@ -254,3 +256,51 @@ def test_render_markdown_mirror_reflects_a_changed_cadence_and_keeps_root_cause_
     assert "every 6 hours" not in markdown
     assert "2026-07-09" in markdown
     assert refresh_mod.ROOT_CAUSE_NOTE_2026_07_09 in markdown
+
+
+class TestResolveClickupToken:
+    """Token resolution order: lazy 1Password resolver first, plain env
+    fallback second (matches wp_publish.py:resolve_credential house style).
+
+    _CLICKUP_TOKEN_CACHE is reset before/after each test so a resolved
+    token from one case can't leak into the next.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_token_cache(self):
+        refresh_mod._CLICKUP_TOKEN_CACHE = None
+        yield
+        refresh_mod._CLICKUP_TOKEN_CACHE = None
+
+    def test_lazy_resolver_token_used_when_env_unset(self, monkeypatch):
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(lsr, "get", lambda name: "lazy-clickup-token")
+        monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+
+        token = refresh_mod._resolve_clickup_token()
+
+        assert token == "lazy-clickup-token"
+
+    def test_env_fallback_used_when_lazy_resolver_empty(self, monkeypatch):
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(lsr, "get", lambda name: None)
+        monkeypatch.setenv("CLICKUP_API_TOKEN", "env-clickup-token")
+
+        token = refresh_mod._resolve_clickup_token()
+
+        assert token == "env-clickup-token"
+
+    def test_both_empty_raises_system_exit_via_fallback_req(self, monkeypatch):
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(lsr, "get", lambda name: None)
+        monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+
+        assert refresh_mod._resolve_clickup_token() == ""
+
+        with pytest.raises(SystemExit) as exc_info:
+            refresh_mod._fallback_req("GET", "/team")
+
+        assert exc_info.value.code == 2
