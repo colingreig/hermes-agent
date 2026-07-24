@@ -32,8 +32,14 @@ vs this copy) to catch drift — nothing currently automates that check.
 
 ## Files
 
-- `op_sdk_resolve.py` — resolves `op://` secret references via the 1Password
-  service-account SDK for `gateway_secrets_wrap.sh` and cron/sentinel scripts.
+- `op_sdk_resolve.py` — resolves `op://` secret references for
+  `gateway_secrets_wrap.sh` and cron/sentinel scripts. **Connect-first since
+  2026-07-24**: prefers a locally-run 1Password Connect server (see
+  `op-connect/`) and falls back to the cloud service-account SDK only when
+  Connect is down or a ref is outside the Connect token's vault scope — this
+  moves routine resolution off the rate-limited cloud account. Verified live:
+  the gateway boot fetches all 142 secrets from both vaults through Connect
+  (`127.0.0.1:8080`) with zero cloud calls.
   Restored 2026-07-21 with the HERMES-PATCH 31 resilience layer (cache,
   retry/backoff, serve-stale, id-fast-path) re-added from the original spec
   in ClickUp 86e2a99q9 after the 2026-07-19 loss; live-verified (142/142
@@ -87,3 +93,28 @@ vs this copy) to catch drift — nothing currently automates that check.
   an unavailable transport remains retryable.
 - `tests/test_offbox_restic_backup.py` — verifies delivery-aware failure and
   recovery persistence through the real Hermes-send boundary.
+- `research_exec.py` — bounded pre-write content research stage. It resolves
+  `SCRAPINGBEE_API_KEY` through Hermes's in-memory lazy 1Password resolver,
+  searches and fetches a small source set, and treats every fetched byte as
+  untrusted data. Analysis uses a fixed direct Anthropic Messages API request:
+  no tool declarations, tool choice, MCP connectors, container, filesystem,
+  shell, browser, agent runtime, or action interpreter. The tool-capable
+  `opencode_exec.py --dangerously-skip-permissions` path is explicitly forbidden
+  for fetched content. Only text response blocks become the brief; tool-use
+  blocks are ignored and produce a flag-and-ship fallback. Its independent
+  `content_pipeline.research.enabled` switch in `~/.hermes/config.yaml`
+  defaults on; any key/API/paywall/bot/analyzer failure is flag-and-ship and
+  leaves the writer able to continue.
+  Execution receipts go to `~/.hermes/logs/research-served.jsonl` without the
+  API key, query text, fetched content, or generated brief.
+- `research_stage_monitor.py` — independent served-ledger liveness check. It
+  reports recent enabled attempts, successful serves, degraded attempts, and
+  served rate; it exits 2 for a missing/degraded enabled-stage window.
+- `content-research-baseline.json` — phase-1 pre-rollout metrics snapshot,
+  including the audited 1/3 content-gate execution rate and the historical
+  0/29 Sonnet serve comparator, with unknown historical metrics explicitly
+  marked uninstrumented rather than inferred.
+- `tests/test_research_stage.py` — verifies secret-safe auth, strict untrusted
+  data boundaries, the analyzer request's zero-tool surface, refusal to
+  interpret tool-use responses, bounded HTTP reads, flag-and-ship fallback,
+  cannibalization context, content-free receipts, and monitor thresholds.
