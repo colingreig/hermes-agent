@@ -119,15 +119,59 @@ def test_ensure_workspace_map_uses_fresh_cache_without_refresh(tmp_path, monkeyp
         max_age_seconds=60,
         output_path=json_path,
         markdown_path=markdown_path,
+        write_brain_note=False,
     )
 
     assert result == cached
     assert not markdown_path.exists()
 
 
+def test_ensure_workspace_map_fresh_cache_still_updates_brain_note(tmp_path, monkeypatch):
+    json_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    brain_path = tmp_path / "brain" / "clickup-workspace-map.md"
+    cached = {
+        "schema_version": refresh_mod.SCHEMA_VERSION,
+        "generated_at": 10_000,
+        "generated_at_iso": "1970-01-01T00:00:10+00:00",
+        "team_id": "team-1",
+        "refresh_cadence_hours": 6,
+        "refresh_cadence_cron_expr": "0 */6 * * *",
+        "refresh_cadence_source": "cron_registration",
+        "spaces": [],
+        "folders": [],
+        "lists": [],
+        "task_tags": {"sampled_task_count": 0, "lookback_days": 7, "tags": []},
+        "clients_aliases": {},
+    }
+    json_path.write_text(json.dumps(cached), encoding="utf-8")
+    monkeypatch.setattr(refresh_mod, "_now_ms", lambda: 10_000)
+    monkeypatch.setattr(
+        refresh_mod,
+        "build_workspace_map",
+        lambda _: pytest.fail("fresh cache must not call ClickUp"),
+    )
+
+    result = refresh_mod.ensure_workspace_map(
+        team_id="team-1",
+        force=False,
+        max_age_seconds=60,
+        output_path=json_path,
+        markdown_path=markdown_path,
+        write_brain_note=True,
+        brain_note_path=brain_path,
+    )
+
+    assert result == cached
+    assert "# ClickUp workspace map" in brain_path.read_text(encoding="utf-8")
+    assert "every 6 hours" in brain_path.read_text(encoding="utf-8")
+    assert not markdown_path.exists()
+
+
 def test_ensure_workspace_map_force_refresh_writes_json_and_markdown(tmp_path, monkeypatch):
     json_path = tmp_path / "clickup-map.json"
     markdown_path = tmp_path / "clickup-workspace-map.md"
+    brain_path = tmp_path / "brain" / "clickup-workspace-map.md"
     workspace_map = {
         "schema_version": refresh_mod.SCHEMA_VERSION,
         "generated_at": 123000,
@@ -141,7 +185,6 @@ def test_ensure_workspace_map_force_refresh_writes_json_and_markdown(tmp_path, m
         "clients_aliases": {},
     }
     monkeypatch.setattr(refresh_mod, "build_workspace_map", lambda team_id: workspace_map)
-    monkeypatch.setattr(refresh_mod, "_write_brain_note", lambda body: None)
 
     result = refresh_mod.ensure_workspace_map(
         team_id="team-1",
@@ -149,11 +192,110 @@ def test_ensure_workspace_map_force_refresh_writes_json_and_markdown(tmp_path, m
         output_path=json_path,
         markdown_path=markdown_path,
         write_brain_note=True,
+        brain_note_path=brain_path,
     )
 
     assert result == workspace_map
     assert json.loads(json_path.read_text(encoding="utf-8"))["team_id"] == "team-1"
     assert "# ClickUp workspace map" in markdown_path.read_text(encoding="utf-8")
+    brain_body = brain_path.read_text(encoding="utf-8")
+    assert "# ClickUp workspace map" in brain_body
+    assert "**Team ID:** `team-1`" in brain_body
+
+
+def test_brain_note_write_does_not_require_basic_memory(tmp_path, monkeypatch):
+    brain_path = tmp_path / "brain" / "clickup-workspace-map.md"
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    refresh_mod.write_workspace_map_note("canonical body\n", brain_path)
+
+    assert brain_path.read_text(encoding="utf-8") == "canonical body\n"
+
+
+def test_brain_note_overwrites_one_canonical_file_without_dated_proliferation(tmp_path):
+    brain_dir = tmp_path / "brain"
+    brain_path = brain_dir / "clickup-workspace-map.md"
+
+    refresh_mod.write_workspace_map_note("first\n", brain_path)
+    refresh_mod.write_workspace_map_note("second\n", brain_path)
+
+    assert brain_path.read_text(encoding="utf-8") == "second\n"
+    assert [path.name for path in brain_dir.iterdir()] == ["clickup-workspace-map.md"]
+
+
+def test_read_workspace_map_note_reads_the_canonical_file(tmp_path):
+    brain_path = tmp_path / "brain" / "clickup-workspace-map.md"
+    refresh_mod.write_workspace_map_note("readable map\n", brain_path)
+
+    assert refresh_mod.read_workspace_map_note(brain_path) == "readable map\n"
+
+
+def test_main_read_note_exposes_the_canonical_read_path(tmp_path, monkeypatch, capsys):
+    brain_path = tmp_path / "brain" / "clickup-workspace-map.md"
+    refresh_mod.write_workspace_map_note("cli-readable map\n", brain_path)
+    monkeypatch.setattr(
+        refresh_mod.sys,
+        "argv",
+        [
+            refresh_mod.THIS_SCRIPT_NAME,
+            "--read-note",
+            "--brain-output",
+            str(brain_path),
+        ],
+    )
+
+    assert refresh_mod.main() == 0
+    assert capsys.readouterr().out == "cli-readable map\n"
+
+
+def test_main_reports_canonical_note_write_failure(monkeypatch, capsys):
+    def _fail_note_write(**_kwargs):
+        raise refresh_mod.WorkspaceMapNoteError(
+            "could not write canonical workspace-map note at /blocked/note.md: denied"
+        )
+
+    monkeypatch.setattr(refresh_mod, "ensure_workspace_map", _fail_note_write)
+    monkeypatch.setattr(refresh_mod.sys, "argv", [refresh_mod.THIS_SCRIPT_NAME])
+
+    assert refresh_mod.main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert (
+        "ERROR: could not write canonical workspace-map note at "
+        "/blocked/note.md: denied"
+    ) in captured.err
+
+
+def test_brain_note_failure_propagates_from_cache_hit(tmp_path, monkeypatch):
+    json_path = tmp_path / "clickup-map.json"
+    blocked_parent = tmp_path / "brain"
+    blocked_parent.write_text("not a directory", encoding="utf-8")
+    brain_path = blocked_parent / "clickup-workspace-map.md"
+    cached = {
+        "schema_version": refresh_mod.SCHEMA_VERSION,
+        "generated_at": 10_000,
+        "team_id": "team-1",
+        "spaces": [],
+        "folders": [],
+        "lists": [],
+        "task_tags": {"sampled_task_count": 0, "lookback_days": 7, "tags": []},
+        "clients_aliases": {},
+    }
+    json_path.write_text(json.dumps(cached), encoding="utf-8")
+    monkeypatch.setattr(refresh_mod, "_now_ms", lambda: 10_000)
+
+    with pytest.raises(
+        refresh_mod.WorkspaceMapNoteError,
+        match="could not write canonical workspace-map note",
+    ):
+        refresh_mod.ensure_workspace_map(
+            force=False,
+            max_age_seconds=60,
+            output_path=json_path,
+            markdown_path=tmp_path / "clickup-workspace-map.md",
+            write_brain_note=True,
+            brain_note_path=brain_path,
+        )
 
 
 def test_detect_markdown_drift_ignores_generated_noise():
