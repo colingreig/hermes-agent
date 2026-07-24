@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "baseline_id": "content-research-phase1-pre-rollout-2026-07-24",
+  "captured_at": "2026-07-24T17:21:44Z",
+  "rollout_state": "research stage not yet served in production",
+  "metrics": {
+    "research_stage_execution_rate": {
+      "value": 0,
+      "unit": "served production runs",
+      "source": "research-served.jsonl did not exist before phase-1 rollout"
+    },
+    "content_gate_execution_rate": {
+      "numerator": 1,
+      "denominator": 3,
+      "source": "brain/plans/2026-07-04-hermes-workflow-audit-and-team-plan.md section 5a"
+    },
+    "sonnet_content_served_mix": {
+      "numerator": 0,
+      "denominator": 29,
+      "source": "brain/learnings/2026-07-04 Hermes content lane audit — Sonnet primary never serves.md",
+      "note": "Historical pre-fix comparator; Sonnet routing was repaired separately on 2026-07-05."
+    },
+    "citation_link_coverage_per_piece": {
+      "value": null,
+      "status": "not historically instrumented"
+    },
+    "validator_fail_rate_for_content": {
+      "value": null,
+      "status": "not historically instrumented"
+    },
+    "research_cost_per_piece_usd": {
+      "value": 0,
+      "status": "pre-rollout"
+    }
+  },
+  "post_rollout_sources": {
+    "stage_execution_and_fallback_rate": "~/.hermes/logs/research-served.jsonl",
+    "served_model_mix_and_llm_cost": "~/.hermes/logs/writer-served.jsonl",
+    "citation_coverage_and_validator_fail_rate": "validator content-run receipts"
+  }
+}
