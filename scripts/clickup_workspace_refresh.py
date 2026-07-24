@@ -2,11 +2,16 @@
 """Refresh a cached ClickUp workspace topology map.
 
 This script maintains a versioned local cache at
-``~/.hermes/state/clickup-map.json`` plus a human-readable markdown mirror at
-``~/.hermes/state/clickup-workspace-map.md``.
+``~/.hermes/state/clickup-map.json`` plus human-readable markdown mirrors at
+``~/.hermes/state/clickup-workspace-map.md`` and the stable canonical brain
+note ``~/brain/clickup-workspace-map.md``.
 
 The cache defaults to a 6 hour TTL. Importers can use ``ensure_workspace_map``
-for on-demand reads with optional forced refreshes.
+for on-demand reads with optional forced refreshes. The supported canonical
+note APIs are ``write_workspace_map_note()`` and
+``read_workspace_map_note()``; the latter is the filesystem-backed equivalent
+of ``read_note("clickup-workspace-map")``. The CLI read equivalent is
+``clickup_workspace_refresh.py --read-note``.
 """
 
 from __future__ import annotations
@@ -17,8 +22,8 @@ import importlib.util
 import json
 import os
 import re
-import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -65,9 +70,7 @@ DEFAULT_MARKDOWN_PATH = STATE_DIR / "clickup-workspace-map.md"
 PRIOR_MARKDOWN_PATH = STATE_DIR / "clickup-workspace-map.prev.md"
 DRIFT_LOG = STATE_DIR / "clickup_topology_drift.jsonl"
 
-BRAIN_PROJECT = "brain"
-BRAIN_FOLDER = "architecture"
-BRAIN_TITLE_PREFIX = "ClickUp workspace map"
+DEFAULT_BRAIN_NOTE_PATH = Path.home() / "brain" / "clickup-workspace-map.md"
 
 _LIST_DETAIL_CACHE: dict[str, dict[str, Any]] = {}
 _LIST_FIELDS_CACHE: dict[str, list[dict[str, Any]]] = {}
@@ -113,6 +116,10 @@ class ClickUpApiError(RuntimeError):
 
     def __str__(self) -> str:
         return f"ClickUp API error {self.status} on {self.path}: {self.message}"
+
+
+class WorkspaceMapNoteError(RuntimeError):
+    """The canonical workspace-map brain note could not be read or written."""
 
 
 def _now_utc() -> dt.datetime:
@@ -809,40 +816,52 @@ def _write_markdown(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
 
 
-def _write_brain_note(body: str) -> None:
+def write_workspace_map_note(
+    body: str,
+    path: Path = DEFAULT_BRAIN_NOTE_PATH,
+) -> None:
+    """Atomically overwrite the one canonical brain note.
+
+    This intentionally uses the filesystem rather than the optional
+    ``basic-memory`` CLI: the refresh job's read/write contract must work on
+    hosts where that binary is not installed. Failures are terminal because a
+    requested brain write is part of a successful refresh, not best effort.
+    """
+    temp_path: Path | None = None
     try:
-        today = dt.date.today().isoformat()
-        title = f"{BRAIN_TITLE_PREFIX} ({today})"
-        proc = subprocess.run(
-            [
-                os.path.expanduser("~/.local/bin/basic-memory"),
-                "tool",
-                "write-note",
-                "--title",
-                title,
-                "--folder",
-                BRAIN_FOLDER,
-                "--type",
-                "reference",
-                "--tags",
-                "clickup,workspace-map,topology,reference",
-                "--project",
-                BRAIN_PROJECT,
-                "--overwrite",
-            ],
-            input=body.encode("utf-8"),
-            capture_output=True,
-            check=False,
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_temp_path = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
         )
-        if proc.returncode != 0:
-            print(
-                f"WARN: bm tool write-note failed: rc={proc.returncode} stderr={proc.stderr.decode('utf-8', 'replace')[:300]}",
-                file=sys.stderr,
-            )
-    except FileNotFoundError:
-        print("WARN: basic-memory CLI not on PATH; skipped brain write", file=sys.stderr)
-    except Exception as exc:  # pragma: no cover - best effort
-        print(f"WARN: brain write failed: {exc}", file=sys.stderr)
+        temp_path = Path(raw_temp_path)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.replace(temp_path, path)
+        temp_path = None
+    except OSError as exc:
+        raise WorkspaceMapNoteError(
+            f"could not write canonical workspace-map note at {path}: {exc}"
+        ) from exc
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def read_workspace_map_note(
+    path: Path = DEFAULT_BRAIN_NOTE_PATH,
+) -> str:
+    """Read the canonical note (equivalent to ``read_note`` for this map)."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise WorkspaceMapNoteError(
+            f"could not read canonical workspace-map note at {path}: {exc}"
+        ) from exc
 
 
 def ensure_workspace_map(
@@ -852,10 +871,16 @@ def ensure_workspace_map(
     max_age_seconds: int = REFRESH_TTL_SECONDS,
     output_path: Path = DEFAULT_JSON_PATH,
     markdown_path: Path = DEFAULT_MARKDOWN_PATH,
-    write_brain_note: bool = False,
+    write_brain_note: bool = True,
+    brain_note_path: Path = DEFAULT_BRAIN_NOTE_PATH,
 ) -> dict[str, Any]:
     cached = read_cached_workspace_map(output_path)
     if not force and cache_is_fresh(cached, max_age_seconds=max_age_seconds):
+        if write_brain_note:
+            write_workspace_map_note(
+                render_markdown_mirror(cached),
+                brain_note_path,
+            )
         return cached
 
     workspace_map = build_workspace_map(team_id)
@@ -872,7 +897,7 @@ def ensure_workspace_map(
         if diff_lines:
             _log_drift(diff_lines)
     if write_brain_note:
-        _write_brain_note(markdown)
+        write_workspace_map_note(markdown, brain_note_path)
     return workspace_map
 
 
@@ -881,20 +906,39 @@ def main() -> int:
     parser.add_argument("--team-id", default=os.environ.get("CLICKUP_TEAM_ID", DEFAULT_TEAM_ID))
     parser.add_argument("--output", default=str(DEFAULT_JSON_PATH), help="JSON cache path")
     parser.add_argument("--markdown-output", default=str(DEFAULT_MARKDOWN_PATH), help="Markdown mirror path")
+    parser.add_argument(
+        "--brain-output",
+        default=str(DEFAULT_BRAIN_NOTE_PATH),
+        help="Canonical brain note path",
+    )
     parser.add_argument("--max-age-seconds", type=int, default=REFRESH_TTL_SECONDS, help="Cache TTL before refresh")
     parser.add_argument("--force", action="store_true", help="Bypass the 6h cache TTL and refresh now")
     parser.add_argument("--local-only", action="store_true", help="Skip the markdown brain-note mirror write")
+    parser.add_argument(
+        "--read-note",
+        action="store_true",
+        help='Read the canonical note (equivalent to read_note("clickup-workspace-map")) and exit',
+    )
     parser.add_argument("--print-json", action="store_true", help="Print the resulting workspace map JSON to stdout")
     args = parser.parse_args()
 
-    workspace_map = ensure_workspace_map(
-        team_id=args.team_id,
-        force=args.force,
-        max_age_seconds=args.max_age_seconds,
-        output_path=Path(args.output),
-        markdown_path=Path(args.markdown_output),
-        write_brain_note=not args.local_only,
-    )
+    try:
+        if args.read_note:
+            sys.stdout.write(read_workspace_map_note(Path(args.brain_output)))
+            return 0
+
+        workspace_map = ensure_workspace_map(
+            team_id=args.team_id,
+            force=args.force,
+            max_age_seconds=args.max_age_seconds,
+            output_path=Path(args.output),
+            markdown_path=Path(args.markdown_output),
+            write_brain_note=not args.local_only,
+            brain_note_path=Path(args.brain_output),
+        )
+    except WorkspaceMapNoteError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     if args.print_json:
         print(json.dumps(workspace_map, indent=2, sort_keys=True))
